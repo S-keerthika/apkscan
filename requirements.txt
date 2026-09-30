@@ -70,6 +70,7 @@ PyYAML==6.0.3
 realtime==2.31.0
 referencing==0.37.0
 reportlab==5.0.1
+razorpay==1.4.2
 requests==2.34.2
 rpds-py==2026.6.3
 six==1.17.0
