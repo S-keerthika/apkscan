@@ -8,15 +8,17 @@ container/venv, resource limits) once you move past local testing.
 """
 import zipfile
 import os
+import json
 import shutil
 import re
 import tempfile 
 import hashlib
-from importlib.resources import path
-import re
+import math
+import ipaddress
+from urllib.parse import urlsplit
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
-from unittest import result
 
 from androguard.core.apk import APK
 
@@ -98,16 +100,56 @@ SUSPICIOUS_CODE_PATTERNS = [
      "direct financial-harm potential if the destination number is attacker-influenced."),
 ]
 
-URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+")
-IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+IP_PATTERN = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
+_REFERENCE_URL_HOSTS = {
+    "schemas.android.com", "developer.android.com", "developer.apple.com",
+    "www.w3.org", "w3.org", "xml.org", "json-schema.org", "apache.org",
+    "logback.qos.ch", "javax.xml.xmlconstants", "ns.adobe.com",
+}
+
+
+def _extract_network_indicators(text):
+    """Return likely endpoint URL literals and valid IPv4 literals only."""
+    urls = set()
+    for raw_url in URL_PATTERN.findall(text or ""):
+        candidate = raw_url.rstrip(".,;:!?)]}>")
+        try:
+            parsed = urlsplit(candidate)
+            host = (parsed.hostname or "").rstrip(".").lower()
+            # Documentation/schema references are commonly embedded as strings,
+            # but are rarely app endpoints. Keep operational API/analytics hosts.
+            if parsed.scheme.lower() not in {"http", "https"} or not host:
+                continue
+            if host in _REFERENCE_URL_HOSTS or any(
+                host.endswith("." + suffix) for suffix in _REFERENCE_URL_HOSTS
+            ):
+                continue
+            urls.add(candidate)
+        except ValueError:
+            continue
+
+    ips = set()
+    for candidate in IP_PATTERN.findall(text or ""):
+        try:
+            address = ipaddress.IPv4Address(candidate)
+        except ipaddress.AddressValueError:
+            continue
+        if address.is_unspecified or address.is_multicast or address.is_reserved:
+            continue
+        ips.add(str(address))
+    return sorted(urls), sorted(ips)
 
 # Known hardcoded-secret shapes worth flagging outright
 SECRET_PATTERNS = {
     r"AKIA[0-9A-Z]{16}": "AWS Access Key ID",
     r"AIza[0-9A-Za-z\-_]{35}": "Google API key",
-    r"-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----": "Embedded private key (PEM)",
+    r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----": "Embedded private key (PEM marker)",
     r"xox[baprs]-[0-9A-Za-z-]{10,}": "Slack token",
-    r"ghp_[0-9A-Za-z]{36}": "GitHub personal access token",
+    r"gh[pousr]_[0-9A-Za-z]{20,}": "GitHub token",
+    r"github_pat_[0-9A-Za-z_]{22,}": "GitHub fine-grained token",
+    r"glpat-[0-9A-Za-z_-]{20,}": "GitLab token",
+    r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}": "JWT-like token",
 }
 
 # ---------------------------------------------------------------------------
@@ -130,12 +172,12 @@ DEEP_CODE_CHECKS = [
     # reading of them the way there is for e.g. a bare SecretKeySpec
     # construction (which is often built correctly with a random key).
     
-    (r"\bDES\b", "Weak encryption", "medium",
+    (r"\bDES\b", "Weak encryption", "low",
      "DES cipher string found",
      "DES has a 56-bit effective key and is brute-forceable on commodity hardware today. "
      "Verify this is a Cipher transformation string and not an unrelated identifier — "
      "bare presence capped at medium pending that confirmation."),
-    (r"\bRC4\b", "Weak encryption", "medium",
+    (r"\bRC4\b", "Weak encryption", "low",
      "RC4 stream cipher string found",
      "RC4 has known keystream biases and is considered broken; avoid for new code. Bare "
      "presence capped at medium pending confirmation this is an actual cipher call."),
@@ -261,7 +303,7 @@ DEEP_CODE_CHECKS = [
 # since compiled bytecode stores class names / method names / literals as
 # separate constant-pool entries rather than as contiguous source text.
 CORRELATION_CHECKS = [
-    (["Ljava/lang/Runtime;", "exec"], "Banned APIs", "medium",
+    (["Ljava/lang/Runtime;", "exec"], "Banned APIs", "low",
      "Runtime.exec reference found",
      "Both the Runtime type and an 'exec' method name are referenced. Common real-world "
      "cause: root-detection checks like `Runtime.getRuntime().exec(new String[]{\"which\", "
@@ -325,6 +367,38 @@ def _compute_priority_score(severity: str, confidence: str) -> int:
     return round(_IMPACT_WEIGHT.get(severity, 0) * _CONFIDENCE_MULT.get(confidence, 1.0))
 
 
+def mask_secret(value: str) -> str:
+    if not value:
+        return ""
+
+    value = str(value)
+
+    if len(value) <= 8:
+        return "*" * len(value)
+
+    return value[:4] + "*" * (len(value) - 8) + value[-4:]
+
+
+def _redact_secret_content(item, secret):
+    """Remove a detected literal from user-facing finding text/evidence."""
+    if isinstance(item, str):
+        if not secret:
+            return item
+        if secret in item:
+            return item.replace(secret, mask_secret(secret))
+        # Evidence may contain a truncated prefix (for example a JWT preview).
+        # Redact those fragments too so reports never disclose a usable prefix.
+        if len(item) >= 10 and item in secret:
+            return mask_secret(item)
+        return item
+    if isinstance(item, dict):
+        return {key: _redact_secret_content(value, secret) for key, value in item.items()}
+    if isinstance(item, list):
+        return [_redact_secret_content(value, secret) for value in item]
+    if isinstance(item, tuple):
+        return tuple(_redact_secret_content(value, secret) for value in item)
+    return item
+
 @dataclass
 class ScanResult:
     file_name: str
@@ -343,10 +417,126 @@ class ScanResult:
     cert_info: Dict[str, Any] = field(default_factory=dict)
     urls_found: List[str] = field(default_factory=list)
     ips_found: List[str] = field(default_factory=list)
+    urls_total_count: int = 0
+    ips_total_count: int = 0
     native_libs: List[Dict[str, str]] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
+
+    # Separate credential findings from general security findings
+    credentials: List[Dict[str, Any]] = field(default_factory=list)
+
     risk_score: int = 0
     risk_level: str = "Low"
+    deep_scan_status: str = "not run"  # not run | running | completed | failed
+    def add_credential(
+        self,
+        credential_type: str,
+        severity: str,
+        confidence: str,
+        source: str,
+        value: str,
+        key: str = "",
+        detail: str = "",
+        score: int = 0,
+        evidence: Dict[str, Any] = None,
+    ):
+        """Add a full-value, deduplicated credential finding.
+
+        This scanner is intended for APK security analysis/validation, so the
+        actual detected value is deliberately retained in the result. The
+        detector is responsible for suppressing false positives; masking here
+        would make a confirmed finding impossible to validate.
+        """
+        value = str(value or "")
+        severity_rank = {"info": 0, "low": 1, "medium": 2, "high": 3}
+        confidence_rank = {
+            "heuristic": 0, "low": 1, "medium": 2,
+            "high": 3, "confirmed": 4,
+        }
+        new_rank = (
+            severity_rank.get(severity, 0),
+            confidence_rank.get(confidence, 0),
+            int(score or 0),
+        )
+        for existing in self.credentials:
+            same_jwt_family = {existing.get("type"), credential_type} <= {"JWT", "JWT-like token"}
+            if existing.get("value") == value and (
+                existing.get("type") == credential_type or same_jwt_family
+            ):
+                # One credential can be found by the resource, string-pool, and
+                # bytecode passes. Keep one risk item and retain each location.
+                ev = existing.setdefault("evidence", {})
+                occurrences = ev.setdefault("occurrences", [])
+                occurrence = {"source": source, "key": key or ""}
+                for name in ("class", "method", "offset", "json_path"):
+                    if (evidence or {}).get(name) is not None:
+                        occurrence[name] = (evidence or {})[name]
+                if occurrence not in occurrences:
+                    occurrences.append(_redact_secret_content(occurrence, value))
+                old_rank = (
+                    severity_rank.get(existing.get("severity"), 0),
+                    confidence_rank.get(existing.get("confidence"), 0),
+                    int(existing.get("score") or 0),
+                )
+                if new_rank > old_rank:
+                    existing.update({"severity": severity, "confidence": confidence, "score": score})
+                return
+        # The user asked for full values in the scanner output. Keep the
+        # evidence and compatibility finding consistent so both the Streamlit
+        # UI and generated PDF expose the complete detected value.
+        safe_evidence = dict(evidence or {})
+        safe_evidence["value"] = value
+        safe_evidence["value_length"] = len(value)
+        safe_evidence["value_sha256"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        safe_evidence.pop("raw_value", None)
+
+        self.credentials.append({
+            "type": credential_type,
+            "severity": severity,
+            "confidence": confidence,
+            "source": source,
+            "key": key,
+            "value": value,
+            "detail": detail,
+            "score": score,
+            "evidence": safe_evidence,
+        })
+
+        # Compatibility bridge for existing PDF/UI renderers that only
+        # consume result.findings.  Credential findings live in their own
+        # category and the risk engine excludes this mirror from the normal
+        # finding score, so credentials are counted exactly once.
+        finding_title = f"Candidate credential: {credential_type}: {source}"
+        finding_detail = (
+            f"Candidate hardcoded credential; activity, validity, and access scope have not "
+            f"been verified. Key: {key or 'unknown'}. Value: {value}. {detail}"
+        ).strip()
+        duplicate = any(
+            f.category == "Hardcoded Credentials"
+            and f.title == finding_title
+            and f.detail == finding_detail
+            for f in self.findings
+        )
+        if not duplicate:
+            self.add(
+                "Hardcoded Credentials",
+                severity,
+                finding_title,
+                finding_detail,
+                confidence=confidence,
+                evidence=safe_evidence,
+            )
+
+    def ranked_credentials(self):
+        return sorted(
+            self.credentials,
+            key=lambda c: (
+                {"high": 3, "medium": 2, "low": 1, "info": 0}.get(c.get("severity"), 0),
+                {"confirmed": 4, "high": 3, "medium": 2, "low": 1, "heuristic": 0}.get(c.get("confidence"), 0),
+                int(c.get("score") or 0),
+            ),
+            reverse=True,
+        )
 
     def add(
         self,
@@ -523,12 +713,13 @@ class ScanResult:
                 if category == "Network strings":
                     if self.urls_found:
                         final_evidence["urls"] = self.urls_found
-                        final_evidence["url_count"] = len(self.urls_found)
+                        final_evidence["url_count"] = self.urls_total_count or len(self.urls_found)
 
                 # IP addresses
                 if category == "Network strings":
                     if self.ips_found:
                         final_evidence["ip_addresses"] = self.ips_found
+                        final_evidence["ipv4_candidate_count"] = self.ips_total_count or len(self.ips_found)
 
                 # Native libraries
                 if category == "Native":
@@ -536,17 +727,41 @@ class ScanResult:
                         final_evidence["native_libraries"] = self.native_libs
 
         # ------------------------------------------------------------
-        # Store finding
+        # Store one finding per logical issue. Deep analysis and fast passes
+        # can discover the same issue through multiple paths; retain distinct
+        # evidence locations as occurrences instead of inflating counts/scores.
         # ------------------------------------------------------------
+        # Keep distinct credentials from the same APK entry separate; their
+        # category/title/source may match while their value fingerprints do not.
+        identity_fields = ("component", "class", "method", "source", "sink", "api", "value_sha256")
+        identity = tuple(str(final_evidence.get(k, "")) for k in identity_fields)
+        for existing in self.findings:
+            if (existing.category, existing.title) != (category, title):
+                continue
+            old_identity = tuple(str(existing.evidence.get(k, "")) for k in identity_fields)
+            if identity == old_identity:
+                old_occurrences = existing.evidence.setdefault("occurrences", [])
+                occurrence = {k: v for k, v in final_evidence.items()
+                              if k in ("offset", "source_instruction_index", "sink_instruction_index")}
+                if occurrence and occurrence not in old_occurrences:
+                    old_occurrences.append(occurrence)
+                effective_severity = max(
+                    (existing.severity, severity),
+                    key=lambda item: _IMPACT_WEIGHT.get(item, 0),
+                )
+                effective_confidence = max(
+                    (existing.confidence, confidence),
+                    key=lambda item: _CONFIDENCE_MULT.get(item, 0),
+                )
+                existing.severity = effective_severity
+                existing.confidence = effective_confidence
+                existing.priority_score = _compute_priority_score(
+                    effective_severity, effective_confidence
+                )
+                return
+
         self.findings.append(
-            Finding(
-                category,
-                severity,
-                title,
-                detail,
-                confidence,
-                final_evidence,
-            )
+            Finding(category, severity, title, detail, confidence, final_evidence)
         )
 
     def ranked_findings(self) -> List[Finding]:
@@ -820,95 +1035,619 @@ def extract_apks_from_zip(zip_path):
 
     return extracted_apks
 
-def _check_hardcoded_secrets(dx, app_package_prefix, result):
+
+import math
+from collections import Counter
+
+
+SECRET_FIELD_NAMES = {
+    "password", "passwd", "pwd", "secret",
+    "clientsecret", "client_secret", "client-secret",
+    "apikey", "api_key", "api-key",
+    "token", "authtoken", "auth_token", "auth-token",
+    "accesstoken", "access_token", "access-token",
+    "refreshtoken", "refresh_token", "refresh-token",
+    "clienttoken", "client_token", "client-token",
+    "privatekey", "private_key", "private-key",
+    "signingkey", "signing_key", "encryptionkey", "encryption_key",
+    "secretkey", "secret_key", "credential", "credentials",
+    "authorization", "bearer", "idtoken", "id_token",
+    "accesskey", "access_key", "consumersecret", "consumer_secret",
+    "appsecret", "app_secret", "authsecret", "auth_secret",
+}
+
+SECRET_CONTEXT_RE = re.compile(
+    r"(?:password|passwd|pwd|secret|client[_-]?secret|app[_-]?secret|"
+    r"auth[_-]?secret|auth[_-]?header|api[_-]?key|apikey|api[_-]?token|"
+    r"access[_-]?token|auth[_-]?token|refresh[_-]?token|client[_-]?token|"
+    r"id[_-]?token|authorization|bearer|credential|credentials|private[_-]?key|"
+    r"signing[_-]?key|encryption[_-]?key|secret[_-]?key|oauth|oauth2|"
+    r"access[_-]?key|consumer[_-]?secret|token[_-]?header|x[_-]?api[_-]?key)", re.I)
+
+PLACEHOLDER_RE = re.compile(
+    r"^(?:changeme|change_me|change-this|your[_-]?(?:api[_-]?key|token|secret|password|credential)|"
+    r"<[^>]+>|\$\{[^}]+\}|replace[_-]?me|replace[_-]?this|"
+    r"insert[_-]?(?:key|token|secret)|example(?:[_-]?(?:key|token|secret))?|"
+    r"dummy|sample|test|testing|not[_-]?set|unset|none|null|unknown|todo|fixme)$", re.I)
+
+TEXT_EXTENSIONS = {
+    ".json", ".xml", ".txt", ".properties", ".conf", ".config",
+    ".ini", ".yaml", ".yml", ".toml", ".env",
+}
+
+
+def normalize_secret_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+_NORMALIZED_SECRET_FIELDS = {normalize_secret_key(x) for x in SECRET_FIELD_NAMES}
+
+
+def is_secret_field(key: str) -> bool:
+    return bool(key) and normalize_secret_key(key) in _NORMALIZED_SECRET_FIELDS
+
+
+# Semantic credential-key detection for arbitrary application-specific names.
+# This intentionally accepts names such as `melee-token`, `authHeader`,
+# `apiTokenV2`, and `session-secret` without treating ordinary words such as
+# `tokenizer` or `header` as secrets.
+_CREDENTIAL_KEY_SEMANTIC_RE = re.compile(
+    r"(?:^|[_\-.])(?:password|passwd|pwd|secret|token|auth|authorization|"
+    r"credential|credentials|apikey|api[_\-.]?key|access[_\-.]?key|"
+    r"access[_\-.]?token|refresh[_\-.]?token|client[_\-.]?secret|"
+    r"client[_\-.]?token|private[_\-.]?key|signing[_\-.]?key|"
+    r"encryption[_\-.]?key|bearer)(?:$|[_\-.])", re.I)
+
+_CREDENTIAL_KEY_COMPACT_RE = re.compile(
+    r"(?:password|passwd|pwd|secret|token|auth|authorization|credential|"
+    r"apikey|accesstoken|refreshtoken|clientsecret|clienttoken|privatekey|"
+    r"signingkey|encryptionkey|bearer)$", re.I)
+
+
+def is_credential_key_semantic(key: str) -> bool:
+    key = str(key or "").strip()
+    if not key:
+        return False
+    if is_secret_field(key):
+        return True
+    normalized = normalize_secret_key(key)
+    return bool(
+        _CREDENTIAL_KEY_SEMANTIC_RE.search(key)
+        or _CREDENTIAL_KEY_COMPACT_RE.search(normalized)
+    )
+
+
+def shannon_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    counts = Counter(value)
+    length = len(value)
+    return -sum((n / length) * math.log2(n / length) for n in counts.values())
+
+
+def is_obvious_non_secret(value: str, key: str = "") -> bool:
+    value = str(value or "").strip()
+    if len(value) < 8:
+        return True
+    lower = value.lower()
+    if lower.startswith(("http://", "https://", "ws://", "wss://")):
+        return True
+    if lower.startswith(("@android/", "@string/", "@color/", "@drawable/")):
+        return True
+    if PLACEHOLDER_RE.fullmatch(value):
+        return True
+    if lower in {
+        "true", "false", "null", "none", "enabled", "disabled",
+        "production", "development", "debug", "release", "localhost",
+        "default", "unknown", "offline", "online", "success", "failure",
+        "authorization", "bearer", "password", "access_token", "client_secret",
+        "signature", "expiresin", "expires_in", "idtoken", "authtoken",
+    }:
+        return True
+    # Negative/status enum names such as NoDualBand are labels, not secrets.
+    if re.fullmatch(r"No[A-Z][A-Za-z0-9]{2,}", value) and re.search(
+        r"no[_-]?(?:password|secret|token|credential)", key, re.I
+    ):
+        return True
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        value, re.I,
+    ):
+        # UUIDs are normally identifiers, but an explicitly credential-like
+        # key (for example `melee-token`) can make a UUID a real token.
+        return not is_credential_key_semantic(key)
+    return False
+
+
+def detect_secret_format(value: str):
+    value = str(value or "").strip()
+    for pattern, label in SECRET_PATTERNS.items():
+        try:
+            if (label.endswith("(PEM marker)") and
+                re.fullmatch(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", value)):
+                continue
+            if re.search(pattern, value):
+                return label
+        except re.error:
+            continue
+    if re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value):
+        return "JWT"
+    if len(value) >= 24 and len(value) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value):
+        return "Base64-like secret"
+    if len(value) >= 16 and len(value) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", value):
+        return "Hex secret"
+    if 20 <= len(value) <= 256 and re.fullmatch(r"[A-Za-z0-9._~+/=-]+", value):
+        return "Opaque token-like value"
+    return None
+
+
+def _looks_like_human_readable_constant(value: str) -> bool:
+    """Reject enum/status/error/resource identifiers and generated framework
+    strings that can look random enough to a generic entropy detector.
+
+    This is deliberately conservative: a real credential may contain mixed
+    case, digits and separators, so we do not reject arbitrary opaque strings.
+    We reject strings whose *shape* strongly indicates application metadata,
+    generated Android/Kotlin messages, routes, resource names, or enum/status
+    constants instead of credential material.
     """
-    Detect potentially hardcoded credentials and secrets.
+    v = str(value or "").strip()
+    if not v:
+        return False
+    low = v.lower()
 
-    This is intentionally heuristic unless the value is traced to a
-    security-sensitive API or field.
+    # Generated Android/Kotlin/framework/resource literals.
+    if low.startswith((
+        "layout/", "fragment/", "activity/", "drawable/", "mipmap/",
+        "color/", "menu/", "navigation/", "/", "android.intent.",
+    )):
+        return True
+    if any(marker in v for marker in (
+        "->", "Ljava/", "Landroid/", "Lkotlin/", "<init>",
+        "getBinding()", "getDataBinder()", "StringBuilder",
+        "call to 'resume' before 'invoke'", "Argument ",
+        "Required argument ", "The tag for ", "null cannot be cast",
+        " is invalid. Received:",
+    )):
+        return True
+    if "%s" in v or "%d" in v or "%1$" in v:
+        return True
+
+    # URLs, route/deeplink-like strings and URI templates are not secrets.
+    if low.startswith(("http://", "https://", "ws://", "wss://", "xfinitydigitalhome://")):
+        return True
+    # MIME/content types are protocol metadata, not credential material.
+    if re.fullmatch(r"[a-z][a-z0-9.+-]*/[a-z0-9.+-]+", low):
+        return True
+
+    # Typical enum/status/error/resource identifiers. Keep mixed alphanumeric
+    # credentials possible; reject identifiers made only of words.
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:[._:-][A-Za-z][A-Za-z0-9]*)+", v):
+        # Dotted/colon-separated Java/Kotlin enum names and namespaced status
+        # constants are metadata unless they contain an explicit secret value
+        # shape (digits mixed into an otherwise opaque token).
+        if re.fullmatch(r"[A-Za-z0-9_.:-]+", v) and not re.search(r"\d", v):
+            return True
+    if re.fullmatch(r"[A-Za-z]+(?:[_-][A-Za-z]+){1,12}", v):
+        parts = re.split(r"[_-]", v)
+        if len(parts) >= 2 and all(len(x) >= 2 for x in parts):
+            return True
+    if re.fullmatch(r"[A-Za-z][A-Za-z ]{7,119}", v) and " " in v:
+        return True
+
+    # Common generated/config property labels. These are often passed through
+    # Kotlin data-class constructors or toString(), where a nearby credential
+    # field name must not make the label itself look like a secret.
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:Url|URL|Type|State|Status|Reason|Action|Event|Name|Id|ID|Version|Success|Failure|Error)", v):
+        return True
+
+    # Generated Kotlin toString fragments and field-label strings.
+    if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\([^)]*", v):
+        return True
+    if re.fullmatch(r"[, ]*[A-Za-z][A-Za-z0-9_]*=[, A-Za-z0-9_{}$.-]*", v):
+        return True
+    return False
+
+
+def _looks_like_credential_key_literal(value: str) -> bool:
+    """Return True only for a literal that plausibly names a credential field.
+
+    Generic bytecode scanning cannot assume that any nearby string containing
+    'password', 'token' or 'auth' is a key. Resource names such as
+    ``layout/activity_create_password_0`` are especially common false positives.
     """
+    v = str(value or "").strip()
+    if not v or len(v) > 96:
+        return False
+    low = v.lower()
+    if _looks_like_human_readable_constant(v):
+        return False
+    if low.startswith(("layout/", "fragment/", "activity/", "drawable/", "mipmap/", "/")):
+        return False
+    if any(ch in v for ch in " /\\=(){}<>:"):
+        return False
+    if re.search(r"(?:_|-)(?:error|failure|failed|reason|type|state|event|action)$", low):
+        return False
+    return is_credential_key_semantic(v)
 
-    secret_patterns = [
-        (
-            r'(?i)\b(password|passwd|pwd)\b\s*[:=]\s*["\'][^"\']{4,}["\']',
-            "Hardcoded password"
-        ),
-        (
-            r'(?i)\b(username|user_name|userid|user_id)\b\s*[:=]\s*["\'][^"\']+["\']',
-            "Hardcoded username"
-        ),
-        (
-            r'(?i)\b(api[_-]?key)\b\s*[:=]\s*["\'][A-Za-z0-9_\-]{12,}["\']',
-            "Hardcoded API key"
-        ),
-        (
-            r'(?i)\b(client[_-]?secret)\b\s*[:=]\s*["\'][^"\']{8,}["\']',
-            "Hardcoded client secret"
-        ),
-        (
-            r'(?i)\b(access[_-]?token)\b\s*[:=]\s*["\'][^"\']{12,}["\']',
-            "Hardcoded access token"
-        ),
-        (
-            r'(?i)\b(secret[_-]?key)\b\s*[:=]\s*["\'][^"\']{8,}["\']',
-            "Hardcoded secret key"
-        ),
-        (
-            r'AKIA[0-9A-Z]{16}',
-            "Possible AWS access key"
-        ),
-        (
-            r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}',
-            "Possible JWT token"
-        ),
-        (
-            r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
-            "Private key material"
-        ),
-    ]
 
+def score_secret_candidate(key: str, value: str, context: str = "", source: str = ""):
+    if not value:
+        return None
+    value = str(value).strip()
+    key = str(key or "").strip()
+    context = str(context or "")
+    source = str(source or "")
+    if is_obvious_non_secret(value, key):
+        return None
+
+    key_signal = is_credential_key_semantic(key)
+    # A credential-looking literal used as a property/enum name is not itself
+    # a secret. This removes cases such as the literal `clientSecret`,
+    # `NoPassword`, or `tokenHeader` being treated as the credential value.
+    if is_credential_key_semantic(value) and not re.search(r"[0-9]", value) and len(value) < 64:
+        return None
+    # Do not mistake enum/status/error/resource identifiers for secrets merely
+    # because their key contains words such as token/password/auth.
+    human_constant = _looks_like_human_readable_constant(value)
+    if human_constant:
+        return None
+    context_blob = f"{key} {context}"
+    context_signal = bool(SECRET_CONTEXT_RE.search(context_blob))
+    operational_context = bool(re.search(
+        r"(?:Authorization|Bearer|addHeader|header|setRequestProperty|setHeader|"
+        r"getStringExtra|putExtra|SharedPreferences|JSONObject|Map;->put|"
+        r"SecretKeySpec|Cipher|Mac;->|Signature;->|PrivateKey|OAuth|token endpoint|"
+        r"accessToken|refreshToken|apiToken|authToken|clientSecret)",
+        context_blob, re.I,
+    ))
+    detected_format = detect_secret_format(value)
+    entropy = shannon_entropy(value)
+    known_format = detected_format and detected_format not in {
+        "Opaque token-like value", "Base64-like secret", "Hex secret"
+    }
+
+    score = 0
+    reasons = []
+    if key_signal:
+        score += 45
+        reasons.append("credential-like field name")
+    if context_signal and not key_signal:
+        score += 30
+        reasons.append("credential-related context")
+    if detected_format:
+        score += 35 if known_format else 15
+        reasons.append(f"matches {detected_format} format")
+    if len(value) >= 16:
+        score += 10
+        reasons.append("long value")
+    if len(value) >= 32:
+        score += 5
+        reasons.append("very long value")
+    if entropy >= 4.5:
+        score += 20
+        reasons.append(f"high entropy ({entropy:.2f})")
+    elif entropy >= 4.0:
+        score += 15
+        reasons.append(f"moderate-high entropy ({entropy:.2f})")
+    elif entropy >= 3.5:
+        score += 8
+        reasons.append(f"moderate entropy ({entropy:.2f})")
+
+    source_lower = source.lower()
+    if (source_lower.startswith("assets/") or source_lower.startswith("res/raw/")
+            or source_lower.endswith(tuple(TEXT_EXTENSIONS))):
+        score += 10
+        reasons.append("configuration/resource location")
+
+    # CRITICAL: entropy/randomness alone is never enough. A generic method or
+    # class name containing "auth/token" is also insufficient. Context-only
+    # candidates are accepted only when the value is strongly opaque, so a
+    # real hardcoded bearer/token can still be found without a named field.
+    strong_context_only = (
+        operational_context and context_signal and not key_signal and not known_format
+        and len(value) >= 20 and entropy >= 4.0
+    )
+    if not known_format and not key_signal and not strong_context_only:
+        return None
+    if score < 45:
+        return None
+
+    if detected_format == "Google API key":
+        # Google API keys are identifiers often embedded in mobile clients;
+        # misuse depends on enabled APIs, quotas, and application restrictions.
+        reasons.append("impact depends on enabled APIs and key restrictions")
+        confidence, severity = "medium", "medium"
+    elif detected_format in {"JWT", "JWT-like token"}:
+        # A signed-token shape is verifiable, but its issuer, scope, and expiry
+        # determine impact; shape alone does not justify a high severity.
+        confidence, severity = "high", "medium"
+    elif known_format and score >= 70:
+        confidence, severity = "high", "high"
+    elif key_signal and score >= 75:
+        confidence, severity = "high", "high"
+    elif score >= 65:
+        confidence, severity = "high", "medium"
+    else:
+        confidence, severity = "medium", "medium"
+
+    return {
+        "score": score,
+        "confidence": confidence,
+        "severity": severity,
+        "type": detected_format or "Generic hardcoded credential",
+        "reasons": reasons,
+        "entropy": round(entropy, 2),
+    }
+
+
+def _credential_candidate_from_instruction(lines, idx):
+    match = re.match(r'^([vp]\d+),\s*"(.+)"$', lines[idx])
+    if not match:
+        return None
+    register, value = match.group(1), match.group(2)
+    context_lines = lines[max(0, idx - 8):min(len(lines), idx + 9)]
+    key_hint = ""
+    # Associate a key only when it is adjacent to the candidate value.
+    # Searching a wide bytecode window links unrelated literals in arrays
+    # (for example a database column named "password" to later setting names).
+    # Explicit fields, Map.put calls, and authentication comparisons have
+    # dedicated detectors for stronger key/value relationships.
+    for previous in reversed(lines[max(0, idx - 2):idx]):
+        key_match = re.match(r'^([vp]\d+),\s*"(.+)"$', previous)
+        if key_match and _looks_like_credential_key_literal(key_match.group(2)):
+            key_hint = key_match.group(2)
+            break
+    return register, value, key_hint, context_lines
+
+
+def _is_generated_or_resource_class(class_name: str) -> bool:
+    """Return True for compiler/generated Android classes that are a major
+    source of credential false positives. These classes contain resource IDs,
+    databinding labels, exception text and other metadata, not embedded
+    credentials. Known credential formats are still handled by the separate
+    DEX string-pool pass.
+    """
+    n = str(class_name or "")
+    simple = n.strip("L;").replace("/", ".")
+    return bool(re.search(
+        r"(?:DataBinderMapperImpl|\$InnerLayoutIdLookup|databinding\.|\.R\$|BuildConfig$)",
+        simple, re.I,
+    ))
+
+
+def _check_generic_hardcoded_credentials(dx, app_package_prefix: str, result: "ScanResult"):
+    """
+    Expensive bytecode credential pass. This pass is deliberately conservative.
+
+    A generic DEX string becomes a credential finding only when there is a
+    semantic credential key, a known credential format, or strong operational
+    evidence that the opaque value is actually used as a secret. Generated
+    Android/DataBinding classes are excluded because they produce many strings
+    containing words such as ``password`` and ``auth`` that are not secrets.
+    """
     seen = set()
-
     for cls in dx.get_classes():
         cname = cls.name
-
-        # Don't attribute library findings to the application.
         if not cname.startswith(app_package_prefix):
             continue
-
+        if _is_generated_or_resource_class(cname):
+            continue
+        readable_class = cname.strip("L;").replace("/", ".")
         for method in cls.get_methods():
-            try:
-                instructions = method.get_instructions()
-            except Exception:
+            lines = _instr_lines(method)
+            if not lines:
                 continue
+            method_context = f"{readable_class}.{method.name}()"
+            for idx, line in enumerate(lines):
+                # Cheap pre-filter: most const-string values cannot possibly be
+                # credentials. Only inspect the surrounding bytecode when the
+                # line itself contains a string literal.
+                if not re.match(r'^([vp]\d+),\s*"', line):
+                    continue
+                candidate = _credential_candidate_from_instruction(lines, idx)
+                if not candidate:
+                    continue
+                register, value, key_hint, context_lines = candidate
+                analysis = score_secret_candidate(
+                    key=key_hint,
+                    value=value,
+                    context=" ".join(context_lines),
+                    source=method_context,
+                )
+                if not analysis:
+                    continue
+                signature = (readable_class, method.name, key_hint, value)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                result.add_credential(
+                    credential_type=analysis["type"],
+                    severity=analysis["severity"],
+                    confidence=analysis["confidence"],
+                    source=method_context,
+                    key=key_hint,
+                    value=value,
+                    score=analysis["score"],
+                    detail=("Potential hardcoded credential detected in application-owned "
+                            "bytecode. " + "; ".join(analysis["reasons"])),
+                    evidence={
+                        "class": readable_class,
+                        "method": method.name,
+                        "register": register,
+                        "instruction_index": idx,
+                        "entropy": analysis["entropy"],
+                        "score": analysis["score"],
+                        "reasons": analysis["reasons"],
+                        "bytecode_context": context_lines,
+                    },
+                )
 
-            for ins in instructions:
+
+def _scan_json_credentials(text: str, source: str, result: "ScanResult"):
+    try:
+        data = json.loads(text)
+    except Exception:
+        return
+
+    def walk(obj, path=""):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                current_path = f"{path}.{key}" if path else str(key)
+                if isinstance(value, str):
+                    analysis = score_secret_candidate(
+                        key=str(key), value=value, context=current_path, source=source
+                    )
+                    if analysis:
+                        result.add_credential(
+                            credential_type=analysis["type"],
+                            severity=analysis["severity"],
+                            confidence=analysis["confidence"],
+                            source=source,
+                            key=current_path,
+                            value=value,
+                            score=analysis["score"],
+                            detail=("Potential hardcoded credential in structured "
+                                    "configuration. " + "; ".join(analysis["reasons"])),
+                            evidence={
+                                "format": "JSON",
+                                "json_path": current_path,
+                                "score": analysis["score"],
+                                "entropy": analysis["entropy"],
+                                "reasons": analysis["reasons"],
+                            },
+                        )
+                walk(value, current_path)
+        elif isinstance(obj, list):
+            for i, value in enumerate(obj):
+                walk(value, f"{path}[{i}]")
+
+    walk(data)
+
+
+KEY_VALUE_RE = re.compile(
+    r"[\"']?([A-Za-z][A-Za-z0-9_.-]{2,})[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_./+=:@\-]{8,})[\"']?",
+    re.VERBOSE,
+)
+
+
+def _scan_text_credentials(text, source, result):
+    for match in KEY_VALUE_RE.finditer(text):
+        key, value = match.group(1), match.group(2)
+        analysis = score_secret_candidate(
+            key=key, value=value, context=match.group(0), source=source
+        )
+        if not analysis:
+            continue
+        result.add_credential(
+            credential_type=analysis["type"],
+            severity=analysis["severity"],
+            confidence=analysis["confidence"],
+            source=source,
+            key=key,
+            value=value,
+            score=analysis["score"],
+            detail="Potential hardcoded credential. " + "; ".join(analysis["reasons"]),
+            evidence={
+                "source": source,
+                "key": key,
+                "score": analysis["score"],
+                "entropy": analysis["entropy"],
+                "reasons": analysis["reasons"],
+            },
+        )
+
+
+def _scan_binary_secret_patterns(data: bytes, source: str, result: "ScanResult"):
+    """Scan printable formats in compiled resource tables and binary assets."""
+    pem_block = re.compile(
+        rb"-----BEGIN (?P<kind>(?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY)-----"
+        rb"\s*[A-Za-z0-9+/=\r\n]{64,}\s*-----END (?P=kind)-----"
+    )
+    for match in pem_block.finditer(data):
+        value = match.group(0).decode("ascii", errors="ignore")
+        result.add_credential(
+            credential_type="Embedded private key (PEM)", severity="high",
+            confidence="high", source=source, value=value,
+            detail="Complete PEM private-key block found in an APK entry.",
+            evidence={"source": source, "format": "PEM private key", "offset": match.start()},
+        )
+    for pattern, label in SECRET_PATTERNS.items():
+        try:
+            rx = re.compile(pattern.encode("ascii"))
+        except (UnicodeEncodeError, re.error):
+            continue
+        for match in rx.finditer(data):
+            value = match.group(0).decode("ascii", errors="ignore")
+            # Header labels are ubiquitous in crypto libraries; only a complete
+            # PEM block above is a credential finding.
+            if label == "Embedded private key (PEM marker)":
+                continue
+            api_key = label == "Google API key"
+            result.add_credential(
+                credential_type=label,
+                severity="medium" if api_key else "high",
+                confidence="medium" if api_key else "high",
+                source=source,
+                value=value,
+                detail=(
+                    "Google API key identifier found in a compiled/binary APK entry. "
+                    "Impact depends on enabled APIs, quotas, and key restrictions."
+                    if api_key else
+                    "Known credential-shaped value found in a compiled/binary APK entry."
+                ),
+                evidence={"source": source, "format": label, "offset": match.start()},
+            )
+
+
+def _scan_apk_resource_credentials(apk_path: str, result: "ScanResult"):
+    try:
+        with zipfile.ZipFile(apk_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                filename = info.filename
+                lower = filename.lower()
+                ext = os.path.splitext(lower)[1]
+
+                # resources.arsc is a binary Android string table. Scan it and
+                # native/assets entries for known token formats, which a text
+                # extension filter silently misses. Bound per-entry reads.
+                binary_candidate = (
+                    lower == "resources.arsc" or lower.endswith(".so")
+                    or lower.startswith("assets/") or lower.startswith("res/raw/")
+                )
+                if binary_candidate and info.file_size <= 64 * 1024 * 1024:
+                    try:
+                        _scan_binary_secret_patterns(zf.read(info), filename, result)
+                    except Exception:
+                        pass
+
+                if not (ext in TEXT_EXTENSIONS or lower.startswith("assets/") or lower.startswith("res/raw/")):
+                    continue
+                # Avoid spending excessive time decoding large bundled assets.
+                if info.file_size > 4 * 1024 * 1024:
+                    continue
                 try:
-                    text = str(ins)
+                    text = zf.read(info).decode("utf-8", errors="ignore")
                 except Exception:
                     continue
+                if ext == ".json":
+                    _scan_json_credentials(text, filename, result)
+                else:
+                    _scan_text_credentials(text, filename, result)
+    except Exception as e:
+        result.add("Credential scan", "low", "Resource credential scan failed", str(e))
 
-                for pattern, title in secret_patterns:
-                    if re.search(pattern, text):
-                        key = (cname, method.name, title, text)
 
-                        if key in seen:
-                            continue
+def _check_hardcoded_secrets(dx, app_package_prefix, result):
+    """Compatibility entry point for the semantic credential detector.
 
-                        seen.add(key)
+    Credential findings must flow through ``result.credentials``.  Do not
+    re-introduce the old regex-only ``Hardcoded data`` detector here because
+    it turns ordinary strings into security findings.
+    """
+    _check_generic_hardcoded_credentials(dx, app_package_prefix, result)
 
-                        result.add(
-                            "Hardcoded data",
-                            "high",
-                            f"{title} in {cname}.{method.name}",
-                            (
-                                f"Potential secret detected in application bytecode. "
-                                f"Matched pattern: {title}. "
-                                f"This is a heuristic finding and should be manually "
-                                f"verified before treating it as an exposed credential."
-                            ),
-                            confidence="heuristic",
-                        )
 
 def extract_apks_from_zip(zip_path: str) -> List[str]:
     extracted_paths = []
@@ -1352,91 +2091,166 @@ def _check_sql_concatenation(dx, app_package_prefix: str, result: "ScanResult") 
 
 
 
-def _check_hardcoded_secret_comparison(dx, app_package_prefix: str, result: "ScanResult") -> None:
-    """
-    Generic "Hardcoded data" check — separate from the crypto-key-specific
-    check above. Looks for String.equals()/equalsIgnoreCase() calls where
-    the argument is a plain const-string literal, which is the classic
-    hardcoded-password/access-key comparison pattern (e.g.
-    `if (userInput.equals("vendorsecretkey"))`).
+def _looks_like_non_secret_literal(value: str) -> bool:
+    """Reject common application/UI/route literals from secret comparison checks."""
+    v = str(value or "").strip()
+    low = v.lower()
+    if not v:
+        return True
+    if len(v) < 8:
+        return True
+    if low.startswith(("/", "http://", "https://", "ws://", "wss://", "android.intent.")):
+        return True
+    if re.fullmatch(r"[a-z0-9_.:/-]+", low) and any(
+        marker in low for marker in (
+            "deeplink", "route", "fragment", "activity", "settings", "screen",
+            "deviceentity", "timeline", "troubleshoot", "activation", "signin",
+        )
+    ):
+        return True
+    common = {
+        "offline", "online", "initialized", "initialised", "activated", "inactive",
+        "active", "success", "failure", "error", "loading", "setup", "cancel",
+        "ok", "true", "false", "null", "sim-auth", "boot_completed",
+        "geofence_transition_exit", "geofence_transition_dwell",
+        "geofence_transition_enter", "connection error", "call error",
+    }
+    return low in common
 
-    Restricted to methods/classes whose name suggests an auth/security
-    context. An earlier, unrestricted version of this check was tested
-    against real (non-vulnerable-by-design) apps and produced 13-16 false
-    positives per app — Intent action strings, SQLite table names, and UI
-    preference values all match ".equals(literal)" too, since that's an
-    extremely common Java pattern with no inherent connection to secrets.
-    The context filter is a blunt instrument (a real backdoor check with
-    an innocuous-sounding method name would be missed), but it cut a real,
-    verified false-positive rate to zero on two clean test apps while
-    still catching the actual InsecureBankv2 backdoor-username case.
+
+def _check_hardcoded_secret_comparison(dx, app_package_prefix: str, result: "ScanResult") -> None:
+    """Find hardcoded authentication values used in equality checks.
+
+    IMPORTANT: an ``equals("literal")`` call is not itself a vulnerability.
+    Routes, status values, Intent actions and UI state are routinely compared
+    to literals.  This detector therefore reports a comparison only when the
+    *literal and its surrounding method/class* provide meaningful credential
+    evidence.  Findings are emitted through ``result.credentials`` rather
+    than the generic HIGH ``Hardcoded data`` category.
     """
     seen = set()
-    noise = {
-        "", "true", "false", "null", "yes", "no", "ok", "cancel", "error",
-        "success", "failure", "utf-8", "utf8", "ascii",
-    }
-    context_re = re.compile(
-        r"login|auth|password|passwd|pwd|credential|secret|token|verify|"
-        r"valid|signin|sign_in|unlock|security|access|backdoor|admin",
+    # Do not treat generic words such as ``auth``, ``token`` or ``login`` in
+    # a class/method name as proof that an equality literal is a secret.
+    # Those names occur constantly in normal state/error handling.
+    auth_context = re.compile(
+        r"password|passwd|pwd|passcode|pin|unlock[_-]?code|credential|secret|"
+        r"api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+        r"client[_-]?secret|client[_-]?token|private[_-]?key|authorization|bearer|oauth",
         re.I,
     )
-    # Java: String.equals()/equalsIgnoreCase(). Kotlin's `==` on strings and
-    # `.equals()` calls typically compile to different sinks entirely
-    # (Intrinsics.areEqual / StringsKt.equals) rather than java.lang.String's
-    # equals — verified against InsecureShop (a Kotlin app), where a plain
-    # `dx.find_methods(methodname="^equals$")` search never matches any
-    # app-owned Kotlin comparison at all. Both sink families are checked so
-    # this works on Java and Kotlin apps alike.
     sink_specs = ["equals", "equalsIgnoreCase", "areEqual"]
+
     for method_name in sink_specs:
-        for sink in dx.find_methods(methodname=f"^{method_name}(\\$default)?$"):
-            for classobj, caller, offset in sink.get_xref_from():
+        try:
+            sinks = dx.find_methods(methodname=f"^{method_name}(\\$default)?$")
+        except Exception:
+            continue
+        for sink in sinks:
+            try:
+                xrefs = sink.get_xref_from()
+            except Exception:
+                continue
+            for classobj, caller, offset in xrefs:
                 if not caller.class_name.startswith(app_package_prefix):
                     continue
-                context = f"{caller.class_name} {caller.name}"
-                if not context_re.search(context):
-                    continue  # no auth/security signal in class or method name — skip
+                readable = caller.class_name.strip("L;").replace("/", ".")
+                context = f"{readable}.{caller.name}"
+                if not auth_context.search(context):
+                    continue
+
                 lines = _instr_lines(caller)
                 for idx, line in enumerate(lines):
-                    if f"->{method_name}(" not in line and f"->{method_name}$default(" not in line:
+                    if f"->{method_name}" not in line:
                         continue
-                    call_desc = line.split(f"->{method_name}")[0]
-                    arg_regs = [t.strip() for t in call_desc.split(",") if _register_of(t.strip())]
-                    if not arg_regs:
-                        continue
-                    # Check ALL argument registers (not just the last) since
-                    # Kotlin sink signatures put the literal in varying
-                    # positions depending on which helper is used.
+                    call_desc = line.split(f"->{method_name}", 1)[0]
+                    arg_regs = [
+                        t.strip() for t in call_desc.split(",")
+                        if _register_of(t.strip())
+                    ]
                     for arg_reg in arg_regs:
-                        for j in range(idx - 1, max(-1, idx - 6), -1):
+                        for j in range(idx - 1, max(-1, idx - 8), -1):
                             m = re.match(r'^([vp]\d+),\s*"(.+)"$', lines[j])
                             if not m or m.group(1) != arg_reg:
                                 continue
                             literal = m.group(2)
-                            if literal.lower() in noise or len(literal) < 5 or len(literal) > 80:
+                            if _looks_like_non_secret_literal(literal):
                                 break
-                            if not re.search(r"[A-Za-z]", literal):
-                                break  # skip pure-numeric/symbol strings, low signal
-                            key = (caller.class_name, caller.name, literal)
-                            if key in seen:
+                            sig = (readable, caller.name, method_name, literal)
+                            if sig in seen:
                                 break
-                            seen.add(key)
-                            cname = caller.class_name.strip("L;").replace("/", ".")
-                            preview = literal if len(literal) <= 50 else literal[:47] + "..."
-                            result.add(
-                                "Hardcoded data", "high",
-                                f"Hardcoded string compared in {cname}.{caller.name}()",
-                                f"Found a comparison against literal \"{preview}\" — code compares a "
-                                "value directly against a string baked into the APK. If this literal "
-                                "is a password, access key, or license/unlock code, it can be "
-                                "extracted by anyone who decompiles the APK (trivial to do) and used "
-                                "to bypass whatever check this gates. Confirmed via register-level "
-                                "bytecode trace.",
-                                confidence="confirmed",
+                            seen.add(sig)
+
+                            # Feed the literal through the same semantic scorer
+                            # used by JSON/text/DEX credential scanning.
+                            surrounding = " ".join(lines[max(0, idx-8):idx+1])
+                            # Remove the candidate itself before checking context;
+                            # otherwise values such as SIM_AUTH_TOKEN_REFRESH_ERROR
+                            # would manufacture their own "token" context.
+                            context_without_literal = surrounding.replace(literal, " ")
+                            comparison_context = context + " " + context_without_literal
+                            analysis = score_secret_candidate(
+                                key="",
+                                value=literal,
+                                context=comparison_context,
+                                source=f"{readable}.{caller.name}()",
+                            )
+                            known_format = bool(detect_secret_format(literal))
+                            entropy = shannon_entropy(literal)
+                            explicit_credential_context = bool(auth_context.search(context_without_literal))
+
+                            # Equality alone is not enough. A short opaque literal is
+                            # accepted only when an explicit credential concept occurs
+                            # nearby (password/passcode/PIN/secret/API key/etc.).
+                            # This removes normal login-state/error comparisons while
+                            # retaining real short unlock codes and similar secrets.
+                            if _looks_like_human_readable_constant(literal) or is_obvious_non_secret(literal):
+                                break
+                            if analysis is None and not (known_format or explicit_credential_context):
+                                break
+                            if analysis is None and not (
+                                len(literal) >= 8 and
+                                entropy >= 2.7 and
+                                bool(re.search(r"[A-Za-z]", literal)) and
+                                (bool(re.search(r"\d", literal)) or len(literal) >= 16)
+                            ):
+                                break
+
+                            if analysis:
+                                base_score = analysis["score"]
+                            elif known_format:
+                                base_score = 70
+                            else:
+                                base_score = 55
+                            if known_format or (len(literal) >= 16 or entropy >= 3.5):
+                                severity, confidence, score = "high", "high", max(base_score, 75)
+                            else:
+                                severity, confidence, score = "medium", "medium", max(base_score, 50)
+
+                            result.add_credential(
+                                credential_type=detect_secret_format(literal) or "Hardcoded authentication value",
+                                severity=severity,
+                                confidence=confidence,
+                                source=f"{readable}.{caller.name}()",
+                                key="comparison literal",
+                                value=literal,
+                                score=score,
+                                detail=(
+                                    "A hardcoded literal is compared in an authentication/security context. "
+                                    "Unlike a generic string comparison, this finding has credential-related "
+                                    "context and should be manually validated to determine whether the value "
+                                    "is an actual password, token, unlock code, or other secret."
+                                ),
+                                evidence={
+                                    "class": readable,
+                                    "method": caller.name,
+                                    "sink": method_name,
+                                    "literal_length": len(literal),
+                                    "entropy": round(entropy, 2),
+                                    "known_format": detect_secret_format(literal),
+                                    "bytecode_context": lines[max(0, idx-8):idx+1],
+                                },
                             )
                             break
-
 
 def _check_tapjacking_layouts(apk: APK, result: "ScanResult") -> bool:
     """
@@ -1457,7 +2271,7 @@ def _check_tapjacking_layouts(apk: APK, result: "ScanResult") -> bool:
     any_protected = False
     parsed_any = False
 
-    for fname in layout_files[:200]:  # cap for very large APKs
+    for fname in layout_files[:400]:  # cap for very large APKs
         try:
             raw = apk.get_file(fname)
             xml_str = etree.tostring(AXMLPrinter(raw).get_xml_obj(), encoding="unicode")
@@ -1496,30 +2310,29 @@ def _check_tapjacking_layouts(apk: APK, result: "ScanResult") -> bool:
 
 
 _STRONG_CRED_FIELD_RE = re.compile(
-    r"(password|passwd|pwd|secret|apikey|api_key|authtoken|auth_token|"
-    r"accesstoken|access_token|privatekey|private_key|secretkey|secret_key)",
+    r"(password|passwd|pwd|secret|apikey|api_key|api-key|"
+    r"authtoken|auth_token|auth-token|access_token|access-token|"
+    r"refreshtoken|refresh_token|clientsecret|client_secret|"
+    r"clienttoken|client_token|privatekey|private_key|"
+    r"signingkey|signing_key|encryptionkey|encryption_key|"
+    r"secretkey|secret_key|credential|credentials|authorization|"
+    r"bearer|id_token|idtoken|accesskey|access_key|"
+    r"consumersecret|consumer_secret|appsecret|app_secret)",
     re.I,
 )
-_WEAK_CRED_FIELD_RE = re.compile(r"(username|login|account)", re.I)
+_WEAK_CRED_FIELD_RE = re.compile(r"(?!x)x")
 
 
 def _check_hardcoded_credential_map(dx, app_package_prefix: str, result: "ScanResult") -> None:
-    """
-    Catches a pattern the field-assignment and equals()-comparison checks
-    both structurally miss: credentials stored as literal key/value pairs
-    in a Map, e.g. Kotlin's `userCreds["shopuser"] = "!ns3csh0p"`, which
-    compiles to `Map.put("shopuser", "!ns3csh0p")` with both arguments as
-    immediately-preceding const-string literals — no field, no comparison
-    at that call site at all. Verified against InsecureShop's real
-    getUserCreds()/HashMap<String,String> credential store.
-    """
-    context_re = re.compile(r"cred|login|auth|password|passwd|pwd|secret|token|user", re.I)
+    """Detect literal credential values stored in Map.put(key, value)."""
+    context_re = re.compile(r"cred|login|auth|password|passwd|pwd|secret|token|oauth", re.I)
     seen = set()
     for sink in dx.find_methods(methodname="^put$"):
         for classobj, caller, offset in sink.get_xref_from():
             if not caller.class_name.startswith(app_package_prefix):
                 continue
-            context = f"{caller.class_name} {caller.name}"
+            readable = caller.class_name.strip("L;").replace("/", ".")
+            context = f"{readable}.{caller.name}"
             if not context_re.search(context):
                 continue
             pairs = _instr_pairs(caller)
@@ -1539,56 +2352,54 @@ def _check_hardcoded_credential_map(dx, app_package_prefix: str, result: "ScanRe
                 if not km or not vm:
                     continue
                 key_lit, val_lit = km.group(1), vm.group(1)
-                if len(val_lit) < 3 or len(val_lit) > 100:
+                analysis = score_secret_candidate(
+                    key=key_lit, value=val_lit,
+                    context=context, source=f"{readable}.{caller.name}()"
+                )
+                if not analysis:
                     continue
-                sig = (caller.class_name, caller.name, key_lit, val_lit)
+                sig = (readable, caller.name, key_lit, val_lit)
                 if sig in seen:
                     continue
                 seen.add(sig)
-                cname = caller.class_name.strip("L;").replace("/", ".")
-                val_preview = val_lit if len(val_lit) <= 50 else val_lit[:47] + "..."
-                result.add(
-                    "Hardcoded data", "high",
-                    f"Hardcoded credential in Map.put() in {cname}.{caller.name}()",
-                    f'Found `.put("{key_lit}", "{val_preview}")` — a literal key/value pair '
-                    "stored directly in a Map, in a method whose name/class suggests a "
-                    "credential store. Confirmed via bytecode (both arguments are "
-                    "immediately-preceding const-string literals).",
-                    confidence="confirmed",
+                result.add_credential(
+                    credential_type=analysis["type"],
+                    severity=analysis["severity"],
+                    confidence="high" if analysis["confidence"] == "high" else "medium",
+                    source=f"{readable}.{caller.name}()",
+                    key=key_lit,
+                    value=val_lit,
+                    score=analysis["score"],
+                    detail="Literal credential-like value stored directly in a Map. " + "; ".join(analysis["reasons"]),
+                    evidence={
+                        "class": readable,
+                        "method": caller.name,
+                        "map_key": key_lit,
+                        "score": analysis["score"],
+                        "entropy": analysis["entropy"],
+                        "reasons": analysis["reasons"],
+                    },
                 )
 
 
 def _check_hardcoded_credential_fields(dx, app_package_prefix: str, result: "ScanResult") -> None:
-    """
-    Finds fields with credential-shaped names (password, secret, apikey,
-    token, ...) that are assigned a plain string literal in a field
-    initializer/constructor — e.g. `public String password =
-    "verycomplicatedpassword";`. This is a distinct pattern from both the
-    crypto-key correlation check (no SecretKeySpec/IvParameterSpec
-    involved) and the equals()-comparison check (no comparison at all,
-    just a literal sitting in a field) — plain field assignment is the
-    most common real-world form of hardcoded credentials.
-    """
+    """Detect credential-shaped fields assigned literal strings."""
     for classobj in dx.get_classes():
         cname = classobj.name
         if not cname.startswith(app_package_prefix):
             continue
-
-        hits = []  # (field_name, literal, is_strong)
+        cname_display = cname.strip("L;").replace("/", ".")
+        seen = set()
         for m in classobj.get_methods():
             pairs = _instr_pairs(m)
             for idx, (opname, output) in enumerate(pairs):
                 if opname not in ("iput-object", "sput-object"):
                     continue
                 field_match = re.search(r"->(\w+)\s+Ljava/lang/String;$", output)
-                if not field_match:
+                if not field_match or idx == 0:
                     continue
                 field_name = field_match.group(1)
-                is_strong = bool(_STRONG_CRED_FIELD_RE.search(field_name))
-                is_weak = bool(_WEAK_CRED_FIELD_RE.search(field_name))
-                if not (is_strong or is_weak):
-                    continue
-                if idx == 0:
+                if not is_credential_key_semantic(field_name):
                     continue
                 prev_name, prev_output = pairs[idx - 1]
                 if "const-string" not in prev_name:
@@ -1597,28 +2408,49 @@ def _check_hardcoded_credential_fields(dx, app_package_prefix: str, result: "Sca
                 if not m2:
                     continue
                 literal = m2.group(1)
-                if len(literal) < 2 or len(literal) > 100:
+                analysis = score_secret_candidate(
+                    key=field_name,
+                    value=literal,
+                    context=f"{cname_display}.{m.name}()",
+                    source=f"{cname_display}.{m.name}()",
+                )
+                if not analysis:
                     continue
-                hits.append((field_name, literal, is_strong))
-
-        if not hits or not any(h[2] for h in hits):
-            continue  # require at least one strong-signal field name to reduce noise
-
-        cname_display = cname.strip("L;").replace("/", ".")
-        for field_name, literal, is_strong in hits:
-            preview = literal if len(literal) <= 50 else literal[:47] + "..."
-            result.add(
-                "Hardcoded data", "high" if is_strong else "medium",
-                f"Hardcoded credential field: {cname_display}.{field_name}",
-                f'Field `{field_name}` is assigned the literal "{preview}" directly in a '
-                "field initializer/constructor — confirmed via bytecode (const-string "
-                "immediately followed by the field-store instruction). Anyone who "
-                "decompiles this APK (trivial to do) gets this value in plaintext.",
-                confidence="confirmed",
-            )
+                sig = (cname_display, field_name, literal)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                result.add_credential(
+                    credential_type=analysis["type"],
+                    severity="high" if analysis["score"] >= 70 else "medium",
+                    confidence="high" if analysis["score"] >= 70 else "medium",
+                    source=f"{cname_display}.{m.name}()",
+                    key=field_name,
+                    value=literal,
+                    score=analysis["score"],
+                    detail=(
+                        f"Field `{field_name}` is assigned a literal value directly in bytecode. "
+                        "The field name is credential-like and the value passed the semantic "
+                        "secret checks."
+                    ),
+                    evidence={
+                        "class": cname_display,
+                        "method": m.name,
+                        "field": field_name,
+                        "score": analysis["score"],
+                        "entropy": analysis["entropy"],
+                        "reasons": analysis["reasons"],
+                    },
+                )
 
 
 def _finding_risk_score(finding):
+    # Credential findings are mirrored into result.findings for legacy report
+    # renderers, but their risk contribution is calculated separately from
+    # result.credentials.  Do not double count them.
+    if getattr(finding, "category", "") == "Hardcoded Credentials":
+        return 0
+
     severity_weight = SEVERITY_WEIGHT.get(
         finding.severity, 0
     )
@@ -1798,15 +2630,15 @@ def _check_exported_component_behavior(
                 # but variable-level taint is not yet proven.
                 result.add(
                     "Exported component analysis",
-                    "medium",
+                    "low",
                     (
-                        f"Exported {component_type} has external input "
-                        f"reaching {sink_description}: "
+                        f"Exported {component_type} source-to-sink candidate "
+                        f"({source_description} -> {sink_description}): "
                         f"{class_name}.{method.name}()"
                     ),
                     (
-                        f"The exported {component_type} reads external "
-                        f"input through {source_description} and later "
+                        f"Candidate only — this is not a confirmed vulnerability. The exported "
+                        f"{component_type} reads external input through {source_description} and later "
                         f"reaches {sink_description} in the same method. "
                         f"This establishes an externally reachable "
                         f"source-to-sink candidate, but does not prove "
@@ -1814,7 +2646,7 @@ def _check_exported_component_behavior(
                         f"without additional variable-level data-flow "
                         f"analysis."
                     ),
-                    confidence="confirmed",
+                    confidence="heuristic",
                     evidence={
                         "component": class_name,
                         "component_type": component_type,
@@ -1826,6 +2658,7 @@ def _check_exported_component_behavior(
                         "sink_instruction_index":
                             relationship["sink_index"],
                         "analysis": "ordered source-to-sink",
+                        "finding_status": "candidate; variable-level taint is not proven",
                     },
                 )
 def run_deep_bytecode_analysis(path: str, result: "ScanResult") -> None:
@@ -1836,11 +2669,21 @@ def run_deep_bytecode_analysis(path: str, result: "ScanResult") -> None:
     """
     from androguard.misc import AnalyzeAPK
 
+    result.deep_scan_status = "running"
     app_pkg = result.package_name.replace(".", "/")
     app_prefix = f"L{app_pkg}"
 
-    a, d, dx = AnalyzeAPK(path)
+    # APKM/APKS/XAPK-style uploads can be ZIP containers with base.apk inside.
+    # The fast analyzer resolves that inner APK; the deep pass must do the same
+    # or Androguard may return an empty analysis while appearing to complete.
+    analysis_path = prepare_apk_for_analysis(path)
+    try:
+        a, d, dx = AnalyzeAPK(analysis_path)
+    finally:
+        if analysis_path != path and os.path.isfile(analysis_path):
+            shutil.rmtree(os.path.dirname(analysis_path), ignore_errors=True)
 
+    deep_check_failures = []
     try:
         _check_exported_component_behavior(
             dx,
@@ -1848,13 +2691,19 @@ def run_deep_bytecode_analysis(path: str, result: "ScanResult") -> None:
             result.exported_components,
             result,
         )
+    except Exception as e:
+        deep_check_failures.append("exported-component behavior")
+        result.add("Deep scan", "low", "Exported-component analysis failed", f"{type(e).__name__}: {e}")
+
+    try:
         _check_javascript_interface_usage(
             dx,
             app_prefix,
             result,
         )
     except Exception as e:
-        print(f"[DeepScan] Exported component analysis failed: {type(e).__name__}: {e}")
+        deep_check_failures.append("WebView JavaScript bridge")
+        result.add("Deep scan", "low", "WebView bridge analysis failed", f"{type(e).__name__}: {e}")
 
     try:
         _check_world_readable_writable(dx, app_prefix, result)
@@ -1875,16 +2724,7 @@ def run_deep_bytecode_analysis(path: str, result: "ScanResult") -> None:
         _check_trust_manager_trivial(dx, app_prefix, result)
     except Exception as e:
         result.add("Deep scan", "low", "TrustManager triviality check failed", str(e))
-        try:
-            _check_runtime_exec_deep(dx, app_prefix, result)
 
-        except Exception as e:
-            result.add(
-                "Deep scan",
-                "low",
-                "Runtime.exec deep check failed",
-                str(e)
-            )
     try:
         _check_runtime_exec_deep(dx, app_prefix, result)
     except Exception as e:
@@ -1896,14 +2736,13 @@ def run_deep_bytecode_analysis(path: str, result: "ScanResult") -> None:
         )
 
     try:
-        _check_hardcoded_secrets(dx, app_prefix, result)
-
+        _check_generic_hardcoded_credentials(dx, app_prefix, result)
     except Exception as e:
         result.add(
             "Deep scan",
             "low",
-            "Hardcoded secret check failed",
-            str(e)
+            "Generic hardcoded credential check failed",
+            str(e),
         )
 
     try:
@@ -1985,9 +2824,43 @@ def run_deep_bytecode_analysis(path: str, result: "ScanResult") -> None:
             )
         ]
 
+    # A bytecode-traced JavaScript bridge call in application code supersedes
+    # the APK-wide string-presence heuristic for the same behavior.
+    has_confirmed_js_bridge = any(
+        f.category == "WebView security"
+        and f.confidence == "confirmed"
+        and "addJavascriptInterface" in f.title
+        for f in result.findings
+    )
+    if has_confirmed_js_bridge:
+        result.findings = [
+            f for f in result.findings
+            if not (f.category == "WebView JavaScript bridge" and f.confidence == "heuristic")
+        ]
+
     # Recompute score/level after deep findings are added
-    score = sum(_finding_risk_score(f) for f in result.findings)
+    finding_score = sum(_finding_risk_score(f) for f in result.findings)
+
+    credential_score = 0
+    for credential in result.credentials:
+        severity_base = {"high": 30, "medium": 20, "low": 10, "info": 0}.get(
+            credential.get("severity", "medium"), 0
+        )
+        confidence_multiplier = {
+            "confirmed": 1.0,
+            "high": 0.85,
+            "medium": 0.60,
+            "low": 0.30,
+            "heuristic": 0.15,
+        }.get(credential.get("confidence", "medium"), 0.15)
+        credential_score += round(severity_base * confidence_multiplier)
+
+    score = finding_score + min(90, credential_score)
     result.risk_score = score
+    had_detector_errors = deep_check_failures or any(
+        finding.category == "Deep scan" for finding in result.findings
+    )
+    result.deep_scan_status = "completed with warnings" if had_detector_errors else "completed"
     if score >= 20:
         result.risk_level = "High"
     elif score >= 8:
@@ -2159,21 +3032,26 @@ def _check_trust_manager_trivial(dx, app_package_prefix, result):
         if not m.class_name.startswith(app_package_prefix):
             continue
 
-        lines = _instr_lines(m)
+        raw_lines = _instr_lines(m)
+        lines = [line.strip() for line in raw_lines if line and line.strip()]
 
+        # Empty output means the disassembler did not provide usable proof.
+        # Never convert a parser/decompiler gap into a confirmed vulnerability.
         if not lines:
             continue
 
-        has_throw = any(
-            re.search(r"\bthrow\b|CertificateException", l)
-            for l in lines
+        has_validation_signal = any(
+            re.search(r"CertificateException|checkValidity|verify\(|getIssuer|\bthrow\b", line, re.I)
+            for line in lines
         )
-
-        is_trivial = len(lines) <= 3
+        normalized = [re.sub(r"\s+", " ", line.lower()) for line in lines]
+        is_empty_override = all(
+            re.search(r"^(?:nop|return-void)(?:\s|$)", line) for line in normalized
+        )
 
         cname = m.class_name.strip("L;").replace("/", ".")
 
-        if is_trivial or not has_throw:
+        if is_empty_override:
 
             # IMPORTANT:
             # m is available here because we are inside "for m ..."
@@ -2192,8 +3070,8 @@ def _check_trust_manager_trivial(dx, app_package_prefix, result):
         f"({len(lines)} instructions).\n\n"
         "PROOF:\n"
         f"{proof}\n\n"
-        "This matches the classic empty-body TrustManager pattern "
-        "that trusts any certificate."
+        "The extracted method body contains only no-op/return instructions, "
+        "which is direct evidence that this override performs no certificate validation."
     ),
 
     confidence="confirmed",
@@ -2208,37 +3086,35 @@ def _check_trust_manager_trivial(dx, app_package_prefix, result):
         "bytecode": lines,
 
         "validation_check": {
-            "certificate_exception_reference": has_throw,
-            "trivial_method": is_trivial,
+            "validation_signal_found": has_validation_signal,
+            "empty_override": is_empty_override,
         },
 
         "proof": (
             f"Class: {cname}\n"
             f"Method: {m.name}\n"
             f"Instructions: {len(lines)}\n"
-            f"CertificateException/throw detected: {has_throw}\n"
-            f"Trivial method: {is_trivial}"
+            f"Validation signal found: {has_validation_signal}\n"
+            f"Empty override: {is_empty_override}"
         ),
     },
 )
 
-        else:
-
-            proof = _get_bytecode_proof(
-                m,
-                "checkServerTrusted"
-            )
-
+        elif not has_validation_signal:
+            proof = _get_bytecode_proof(m, "checkServerTrusted")
             result.add(
                 "MITM / hostname verification",
-                "medium",
-                f"checkServerTrusted() in {cname} — has some validation logic",
+                "low",
+                f"Review custom checkServerTrusted() in {cname}",
                 (
-                    "Contains throw/exception-related instructions, so it is not "
-                    "the trivial accept-all pattern.\n\n"
-                    "PROOF:\n"
-                    f"{proof}"
+                    "The method body was extracted, but this lightweight check could "
+                    "not identify a recognized validation signal. This is a review "
+                    "candidate, not proof that certificates are accepted.\n\n"
+                    f"Evidence:\n{proof}"
                 ),
+                confidence="heuristic",
+                evidence={"type": "bytecode-traced TrustManager candidate", "class": cname,
+                          "method": m.name, "instruction_count": len(lines), "bytecode": lines},
             )
 
 
@@ -2457,7 +3333,14 @@ def _get_method_proof(m, keyword=None):
         + "\n".join(proof_lines[:10])
     )
 
-def analyze_apk(path: str, original_filename: str) -> ScanResult:
+def analyze_apk(path: str, original_filename: str, deep_scan: bool = True) -> ScanResult:
+    """
+    Analyze one APK.
+
+    Full/deep mode is enabled by default so credential and bytecode detectors
+    are not silently skipped. Pass ``deep_scan=False`` only for an explicit
+    quick scan where bytecode confirmation is intentionally omitted.
+    """
     result = ScanResult(file_name=original_filename, sha256=sha256_of(path))
 
     analysis_path = prepare_apk_for_analysis(path)
@@ -2585,35 +3468,66 @@ def analyze_apk(path: str, original_filename: str) -> ScanResult:
         pass
 
     # ---- Exported components -----------------------------------------------
-    # A component is effectively exported if z, OR if
-    # it's unset but the component has an intent-filter (implicit export
-    # pre-Android-12 behavior), and it declares no permission guard.
+    # Resolve manifest shorthand names, honor Android 12+ exported semantics,
+    # account for application/provider permission guards, and retain ownership.
     try:
+        package_name = result.package_name or ""
+        try:
+            target_sdk_int = int(result.target_sdk)
+        except (TypeError, ValueError):
+            target_sdk_int = 0
+        app_permission = app_attribs.get(f"{ANDROID_NS}permission")
+
         for comp_type in ("activity", "service", "receiver", "provider"):
             for el in manifest_root.iter(comp_type):
-                name = el.attrib.get(f"{ANDROID_NS}name", "?")
-                exported_attr = el.attrib.get(f"{ANDROID_NS}exported")
-                permission = el.attrib.get(f"{ANDROID_NS}permission")
-                has_intent_filter = el.find("intent-filter") is not None
+                raw_name = el.attrib.get(f"{ANDROID_NS}name", "?")
+                if raw_name.startswith("."):
+                    name = f"{package_name}{raw_name}"
+                elif "." not in raw_name and package_name:
+                    name = f"{package_name}.{raw_name}"
+                else:
+                    name = raw_name
 
-                is_exported = exported_attr == "true" or (
-                    exported_attr is None and has_intent_filter
+                exported_attr = el.attrib.get(f"{ANDROID_NS}exported")
+                has_intent_filter = el.find("intent-filter") is not None
+                if exported_attr is not None:
+                    is_exported = exported_attr.lower() == "true"
+                else:
+                    # For targetSdk 31+, components with filters must declare
+                    # exported explicitly and are not implicitly exported.
+                    is_exported = target_sdk_int < 31 and has_intent_filter
+
+                permission = el.attrib.get(f"{ANDROID_NS}permission") or app_permission
+                if comp_type == "provider" and not permission:
+                    read_permission = el.attrib.get(f"{ANDROID_NS}readPermission")
+                    write_permission = el.attrib.get(f"{ANDROID_NS}writePermission")
+                    permission = read_permission if read_permission and write_permission else None
+
+                if not is_exported or permission:
+                    continue
+
+                owner = (
+                    "app-package" if package_name and
+                    (name == package_name or name.startswith(package_name + "."))
+                    else "outside-app-package"
                 )
-                if is_exported and not permission:
-                    result.exported_components.append({"type": comp_type, "name": name})
+                result.exported_components.append({
+                    "type": comp_type,
+                    "name": name,
+                    "manifest_name": raw_name,
+                    "ownership": owner,
+                })
     except Exception:
         pass
 
     if result.exported_components:
-        by_type: Dict[str, int] = {}
-        for c in result.exported_components:
-            by_type[c["type"]] = by_type.get(c["type"], 0) + 1
-            print("\n=== EXPORTED COMPONENTS ===")
-            for component in result.exported_components:
-                print(
-                    f"{component.get('type', 'unknown').upper()}: "
-                    f"{component.get('name', 'unknown')}"
-                )
+        print("\n=== EXPORTED COMPONENTS ===")
+        for component in result.exported_components:
+            print(
+                f"{component.get('type', 'unknown').upper()}: "
+                f"{component.get('name', 'unknown')} "
+                f"[{component.get('ownership', 'unknown')}]"
+            )
         print("============================\n")
 
         type_label = {
@@ -2622,53 +3536,38 @@ def analyze_apk(path: str, original_filename: str) -> ScanResult:
             "receiver": ("Exported Broadcast Receiver", "low"),
             "provider": ("Exported Content Provider", "medium"),
         }
+        grouped_components = {}
+        for component in result.exported_components:
+            grouped_components.setdefault(
+                (component["type"], component["ownership"]), []
+            ).append(component)
 
-        # Sensitivity escalation for exported Content Providers specifically
-        # (per calibration: "High only if sensitive data/operations are
-        # accessible" — rather than leave this as a flat guess, check two
-        # concrete, cheap signals: does the app hold sensitive-data
-        # permissions at all, and does the provider's own class name hint
-        # at sensitive content). Neither is proof, but together they're a
-        # meaningfully better basis for "high" than assuming every exported
-        # provider is equally dangerous regardless of what it holds.
-        _SENSITIVE_PERMS = {
-            "android.permission.READ_CONTACTS", "android.permission.READ_CALL_LOG",
-            "android.permission.READ_SMS", "android.permission.ACCESS_FINE_LOCATION",
-            "android.permission.ACCESS_COARSE_LOCATION", "android.permission.CAMERA",
-            "android.permission.RECORD_AUDIO",
-        }
-        _SENSITIVE_NAME_RE = re.compile(
-            r"user|account|payment|credential|contact|message|token|card|bank|auth|wallet",
-            re.I,
-        )
-        app_has_sensitive_perms = bool(_SENSITIVE_PERMS & set(perms))
-        provider_names = [c["name"] for c in result.exported_components if c["type"] == "provider"]
-        provider_name_looks_sensitive = any(_SENSITIVE_NAME_RE.search(n) for n in provider_names)
-
-        for comp_type, count in by_type.items():
-            label, sev = type_label.get(comp_type, (f"Exported {comp_type}", "low"))
-            escalation_note = ""
-            component_names = [
-                    c["name"]
-                    for c in result.exported_components
-                    if c["type"] == comp_type
-                ]
+        for (comp_type, owner), components in grouped_components.items():
+            label, app_severity = type_label.get(comp_type, (f"Exported {comp_type}", "low"))
+            is_app_owned = owner == "app-package"
             result.add(
                 "Attack surface",
-                sev,
-                f"{label}: {count} unguarded",
+                app_severity if is_app_owned else "info",
+                f"{label}: {len(components)} unguarded "
+                f"({'app package' if is_app_owned else 'outside app package'})",
                 (
-                    f"Other apps can interact with this exported "
-                    f"{comp_type} without a declared permission."
+                    f"The manifest exposes {len(components)} {comp_type}(s) without a "
+                    f"permission guard. Component ownership is classified by comparing its "
+                    f"resolved class name with package {package_name or '(unknown)'}. "
+                    + ("Review these app-package components for sensitive operations."
+                       if is_app_owned else "These are commonly merged SDK/framework/test components; "
+                       "they remain externally reachable, but this inventory does not establish "
+                       "that app-owned sensitive data or operations are exposed.")
                 ),
                 confidence="confirmed",
                 evidence={
                     "component_type": comp_type,
-                    "count": count,
-                    "components": component_names,
+                    "ownership": owner,
+                    "ownership_basis": "resolved manifest class name compared with APK package name",
+                    "count": len(components),
+                    "components": components,
                 },
             )
-            
 
     # ---- Network security config (trusting user/attacker-installed CAs) -----
     try:
@@ -2719,6 +3618,17 @@ def analyze_apk(path: str, original_filename: str) -> ScanResult:
     except Exception as e:
         result.add("Signing", "low", "Certificate parsing failed", str(e))
 
+    # Resource/assets credential scan must run regardless of certificate parsing.
+    try:
+        _scan_apk_resource_credentials(analysis_path, result)
+    except Exception as e:
+        result.add(
+            "Credential scan",
+            "low",
+            "APK resource credential scan failed",
+            str(e),
+        )
+
     # ---- String / code-level scan -------------------------------------------
     _LIB_CAVEAT = (
         " Note: this pass scans the whole compiled APK's string pool with no "
@@ -2733,6 +3643,11 @@ def analyze_apk(path: str, original_filename: str) -> ScanResult:
         d = apk.get_dex()
         if d:
             strings_blob = _extract_dex_strings(apk)
+                        # Known-format strings are handled below. Arbitrary credential
+            # detection is intentionally semantic: structured resources are
+            # scanned immediately, while application-owned DEX literals are
+            # confirmed in the deep bytecode phase. This avoids treating the
+            # entire DEX string pool as credentials.
 
             for pattern, severity, desc in SUSPICIOUS_CODE_PATTERNS:
                 if re.search(pattern, strings_blob):
@@ -2802,13 +3717,33 @@ def analyze_apk(path: str, original_filename: str) -> ScanResult:
                     "APIs considered unsafe for security-sensitive use in modern guidance.",
                 )
 
-            # Hardcoded secrets
+            # Known credential formats are reported in the dedicated
+            # credential section instead of generic Hardcoded data.
             for pattern, label in SECRET_PATTERNS.items():
-                if re.search(pattern, strings_blob):
-                    result.add(
-                        "Hardcoded data", "high", f"Possible hardcoded secret: {label}",
-                        "A string matching a known credential format was found in the compiled "
-                        "code — if real, this key/token should be revoked and moved server-side.",
+                for match in re.finditer(pattern, strings_blob):
+                    value = match.group(0)
+                    # A header string without its encoded body is not a key.
+                    if label == "Embedded private key (PEM marker)":
+                        continue
+                    is_jwt = label in {"JWT", "JWT-like token"}
+                    result.add_credential(
+                        credential_type=label,
+                        severity="medium" if is_jwt else "high",
+                        confidence="high",
+                        source="DEX string pool",
+                        key="",
+                        value=value,
+                        score=90,
+                        detail=(
+                            "JWT-shaped token found in the compiled DEX. Validate its issuer, scope, and expiry with the owner; token shape alone does not prove it is active."
+                            if is_jwt else
+                            "Known credential-shaped value detected in the compiled DEX string pool. Confirm ownership, scope, restrictions, and whether it is still active."
+                        ),
+                        evidence={
+                            "scope": "all DEX string pools",
+                            "pattern": label,
+                            "matched_format": value[:120],
+                        },
                     )
 
             # Tapjacking: informational nudge since this can't be reliably proven
@@ -2823,22 +3758,53 @@ def analyze_apk(path: str, original_filename: str) -> ScanResult:
                     "one out.",
                 )
 
-            urls = set(URL_PATTERN.findall(strings_blob))
-            ips = set(IP_PATTERN.findall(strings_blob))
-            result.urls_found = sorted(urls)[:50]
-            result.ips_found = sorted(ips)[:50]
+            urls, ips = _extract_network_indicators(strings_blob)
+            result.urls_total_count = len(urls)
+            result.ips_total_count = len(ips)
+            result.urls_found = urls[:50]
+            result.ips_found = ips[:50]
 
-            if urls:
+            if urls or ips:
                 result.add(
-                    "Network strings", "info", f"{len(urls)} hardcoded URL(s) found",
-                    "Review these manually — not inherently malicious, but a common place to "
-                    "spot C2 endpoints or analytics/ad SDKs.",
+                    "Network strings", "info",
+                    f"{len(urls)} URL candidate(s), {len(ips)} valid IPv4 candidate(s) found",
+                    "These are endpoint-like literals in compiled strings, not proof that the "
+                    "app connects to them. Some can come from bundled SDKs or configuration; "
+                    "review the host and call site before treating them as network behavior.",
+                    confidence="heuristic",
                 )
     except Exception as e:
         result.add("Code patterns", "low", "DEX string scan failed", str(e))
 
+    # Optional expensive phase. The default remains fast so the UI can return
+    # a result without constructing Androguard's full cross-reference graph.
+    if deep_scan:
+        try:
+            run_deep_bytecode_analysis(analysis_path, result)
+        except Exception as e:
+            result.deep_scan_status = "failed"
+            result.add(
+                "Deep scan", "low", "Deep bytecode analysis failed", str(e),
+            )
+
     # ---- Score & finalize -----------------------------------------------------
-    score = sum(_finding_risk_score(f) for f in result.findings)
+    finding_score = sum(_finding_risk_score(f) for f in result.findings)
+
+    credential_score = 0
+    for credential in result.credentials:
+        severity_base = {"high": 30, "medium": 20, "low": 10, "info": 0}.get(
+            credential.get("severity", "medium"), 0
+        )
+        confidence_multiplier = {
+            "confirmed": 1.0,
+            "high": 0.85,
+            "medium": 0.60,
+            "low": 0.30,
+            "heuristic": 0.15,
+        }.get(credential.get("confidence", "medium"), 0.15)
+        credential_score += round(severity_base * confidence_multiplier)
+
+    score = finding_score + min(90, credential_score)
     result.risk_score = score
     if score >= 20:
         result.risk_level = "High"
@@ -2850,16 +3816,33 @@ def analyze_apk(path: str, original_filename: str) -> ScanResult:
     return result
 
 
-def _extract_dex_strings(apk: APK, max_bytes: int = 20_000_000) -> str:
-    """Pull the printable string pool out of all DEX files, capped for safety."""
+
+_DEX_STRING_RE = re.compile(rb"[\x20-\x7e]{5,}")
+
+def _extract_dex_strings(apk: APK) -> str:
+    """
+    Extract printable strings from every DEX file.
+
+    This keeps the all-DEX coverage but avoids retaining the individual regex
+    match list after each DEX has been converted to text. There is deliberately
+    no global byte cutoff because later classes*.dex files may contain real
+    credentials.
+    """
     chunks = []
-    total = 0
-    for dex_bytes in apk.get_all_dex():
-        total += len(dex_bytes)
-        if total > max_bytes:
-            break
-        # crude but fast: printable ASCII runs of length >= 5
-        chunks.append(
-            b" ".join(re.findall(rb"[\x20-\x7e]{5,}", dex_bytes)).decode("ascii", errors="ignore")
-        )
-    return " ".join(chunks)
+    try:
+        dex_files = apk.get_all_dex()
+    except Exception:
+        dex_files = []
+
+    for dex_bytes in dex_files:
+        try:
+            blob = _DEX_STRING_RE.sub(
+                lambda m: m.group(0) + b"\n",
+                dex_bytes,
+            )
+            if blob:
+                chunks.append(blob.decode("utf-8", errors="ignore"))
+        except Exception:
+            continue
+
+    return "\n".join(chunks)
