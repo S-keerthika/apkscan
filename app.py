@@ -298,6 +298,13 @@ def build_pdf_report(result, apk_name):
     metadata = [
         [Paragraph("<b>APK FILE</b>", small_style), Paragraph(safe(apk_name), body_style)],
         [Paragraph("<b>SHA-256</b>", small_style), Paragraph(f"<font name='Courier'>{safe(result.sha256)}</font>", small_style)],
+        [Paragraph("<b>ANALYSIS MODE</b>", small_style), Paragraph(safe({
+            "completed": "Comprehensive bytecode analysis completed",
+            "completed with warnings": "Comprehensive analysis completed with detector failures (review findings)",
+            "running": "Comprehensive bytecode analysis incomplete",
+            "failed": "Comprehensive bytecode analysis failed",
+            "not run": "Fast static pass only (deep bytecode analysis not run)",
+        }.get(getattr(result, "deep_scan_status", "not run"), "Analysis mode unavailable")), body_style)],
     ]
 
     metadata_table = Table(metadata, colWidths=[32 * mm, 132 * mm])
@@ -340,6 +347,17 @@ def build_pdf_report(result, apk_name):
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
     ]))
     story.append(summary_table)
+    native_count = sum(int(item.get("count", 0) or 0) for item in (result.native_libs or []))
+    score_note = (
+        "Risk score is weighted priority points, not a percentage, probability, or score out of 100. "
+        "Finding scores combine severity and evidence confidence; credential contribution is capped at 90 points. "
+        "Risk bands: Low below 8, Medium 8–19, High 20 or more."
+    )
+    coverage_note = (
+        f"Coverage: static manifest, resources, and DEX analysis. {native_count} native library file(s) "
+        "were inventoried only; native code and runtime behavior were not analyzed."
+    )
+    story.append(Paragraph(f"<b>Score meaning:</b> {safe(score_note)}<br/><b>Coverage:</b> {safe(coverage_note)}", small_style))
     story.append(Spacer(1, 15))
 
     story.append(Paragraph("1. Application Information", section_style))
@@ -412,6 +430,32 @@ def build_pdf_report(result, apk_name):
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ]))
         story.append(header)
+        story.append(Spacer(1, 4))
+        if finding.category == "Hardcoded Credentials" or "candidate" in finding.title.lower():
+            assessment = "Candidate — validate manually"
+        elif finding.confidence == "heuristic":
+            assessment = "Heuristic — validate manually"
+        else:
+            assessment = "Evidence confirmed — impact may still need review"
+        finding_meta = Table(
+            [[
+                Paragraph(f"<b>Priority points:</b> {safe(finding.priority_score)}", small_style),
+                Paragraph(f"<b>Evidence confidence:</b> {safe(finding.confidence)}", small_style),
+                Paragraph(f"<b>Assessment:</b> {safe(assessment)}", small_style),
+            ]],
+            colWidths=[48 * mm, 52 * mm, 60 * mm],
+        )
+        finding_meta.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), LIGHT_GRAY),
+            ("BOX", (0, 0), (-1, -1), 0.4, BORDER),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, BORDER),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(finding_meta)
         story.append(Spacer(1, 4))
         story.append(Paragraph(f"<b>Description</b><br/>{safe(finding.detail)}", body_style))
 
@@ -1024,7 +1068,8 @@ def render_results(scan, authed):
     n = len(result.findings) if scan else 0
     sev = {s: sum(1 for f in result.findings if f.severity == s) for s in ["high", "medium", "low", "info"]}
     col = {"High": "#DC2626", "Medium": "#F59E0B", "Low": "#16A34A"}.get(result.risk_level, "#0D9488")
-    frac = max(0.04, min(result.risk_score / 40, 1.0)) * 360
+    # The ring represents the risk band, not a capped numeric score scale.
+    frac = {"High": 360, "Medium": 240, "Low": 120}.get(result.risk_level, 60)
     total = max(1, n)
     seg = "".join(f'<div style="width:{sev[k] / total * 100:.1f}%;background:{c}"></div>'
                   for k, c in [("high", "#DC2626"), ("medium", "#F59E0B"), ("low", "#0D9488"), ("info", "#94A3B8")])
@@ -1043,7 +1088,8 @@ def render_results(scan, authed):
         sev_counts = {s: sum(1 for f in result.findings if f.severity == s) for s in ["high", "medium", "low", "info"]}
         st.markdown(f"### {html.escape(result.app_name or scan['name'])}", unsafe_allow_html=True)
         c = st.columns(4)
-        c[0].markdown(kpi("Risk level", f"{RISK_COLOR.get(result.risk_level, '')} {result.risk_level}", f"Score {result.risk_score}"), unsafe_allow_html=True)
+        c[0].markdown(kpi("Risk level", f"{RISK_COLOR.get(result.risk_level, '')} {result.risk_level}", f"{result.risk_score} weighted points"), unsafe_allow_html=True)
+        st.caption("The risk score is an unbounded weighted priority total, not a percentage or probability of compromise.")
         c[1].markdown(kpi("Findings", n, f"{sev_counts['high']} high • {sev_counts['medium']} medium"), unsafe_allow_html=True)
         c[2].markdown(kpi("Package", result.package_name or "unknown", f"v{result.version_name or '?'} ({result.version_code or '?'})"), unsafe_allow_html=True)
         c[3].markdown(kpi("SDK", f"{result.min_sdk or '?'} → {result.target_sdk or '?'}", "min → target"), unsafe_allow_html=True)
@@ -1066,21 +1112,35 @@ def render_results(scan, authed):
             st.success("No issues flagged.")
         for f in result.ranked_findings():
             with st.expander(f"{SEVERITY_COLOR.get(f.severity, '')} [{f.priority_score}] {f.category}: {f.title}"):
+                if f.category == "Hardcoded Credentials" or "candidate" in f.title.lower() or f.confidence == "heuristic":
+                    st.caption(f"Candidate/manual review • Evidence confidence: {f.confidence}")
+                else:
+                    st.caption(f"Evidence confidence: {f.confidence}; this does not by itself establish exploitability.")
                 st.write(f.detail)
                 if f.evidence:
                     st.json(f.evidence)
 
     with tabs[2]:
         comps = result.exported_components
-        st.markdown(f"**{len(comps)} exported component(s)** reachable by other apps without a permission guard.")
+        app_owned = sum(1 for comp in comps if comp.get("ownership") == "app-package")
+        outside_package = sum(1 for comp in comps if comp.get("ownership") == "outside-app-package")
+        st.markdown(
+            f"**{len(comps)} unguarded exported component(s)**: {app_owned} in the APK package, "
+            f"{outside_package} outside it. Outside-package components are commonly merged SDK/framework "
+            "entries and still need context review."
+        )
         if comps:
             st.dataframe(comps, use_container_width=True, hide_index=True)
         else:
             st.success("No unprotected exported components found.")
         if result.urls_found or result.ips_found:
-            with st.expander(f"Network endpoints ({len(result.urls_found)} URLs, {len(result.ips_found)} IPs)"):
-                st.write(sorted(set(result.urls_found))[:200])
-                st.write(sorted(set(result.ips_found))[:100])
+            with st.expander(
+                f"Endpoint-like literals ({result.urls_total_count or len(result.urls_found)} URL candidates, "
+                f"{result.ips_total_count or len(result.ips_found)} valid IPv4 candidates)"
+            ):
+                st.caption("String matches do not prove the app connects to these hosts. At most 50 of each type are retained.")
+                st.write(sorted(set(result.urls_found))[:50])
+                st.write(sorted(set(result.ips_found))[:50])
 
     with tabs[3]:
         st.caption("Bundled native libraries inventoried from the APK (inventory only — native code is not disassembled).")
@@ -1146,7 +1206,8 @@ def run_scan(apk_paths, display_name, deep_scan, user, cleanup_path):
             apk_path = apk_paths[0]
             for apk_path in apk_paths:
                 apk_name = display_name or os.path.basename(apk_path)
-                result = analyze_apk(apk_path, apk_name)
+                # The checkbox owns fast/deep selection; never run deep analysis twice.
+                result = analyze_apk(apk_path, apk_name, deep_scan=False)
                 if deep_scan:
                     run_deep_bytecode_analysis(apk_path, result)
                 entropy = compute_entropy_report(apk_path)
@@ -1159,8 +1220,16 @@ def run_scan(apk_paths, display_name, deep_scan, user, cleanup_path):
             st.error(f"Analysis failed: {e}")
             st.code(traceback.format_exc())
         finally:
-            if cleanup_path and os.path.exists(cleanup_path):
-                os.remove(cleanup_path)
+            # ZIP extraction creates one temporary APK per entry; remove all of them too.
+            paths_to_remove = set(apk_paths or [])
+            if cleanup_path:
+                paths_to_remove.add(cleanup_path)
+            for path_to_remove in paths_to_remove:
+                try:
+                    if path_to_remove and os.path.isfile(path_to_remove):
+                        os.remove(path_to_remove)
+                except OSError:
+                    pass
 
 
 def main():
