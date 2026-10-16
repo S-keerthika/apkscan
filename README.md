@@ -206,24 +206,44 @@ Low/Medium/High risk score — this is a heuristic, not ground truth.
   scriptable without the UI — see `analyze_apk(path, filename)`)
 - `requirements.txt`
 
-## Before you host this publicly
+## SaaS launch requirements
 
-This was built for local use. Before putting it on the internet:
+The app already has sign-in, email verification, scan quotas/payments, scan history,
+and PDF export. That makes it a SaaS prototype; it is **not ready for public customer
+traffic yet**. Scans currently run synchronously in the Streamlit process. When hosted,
+uploaded APKs and reports are processed and stored by the service, so publish clear
+retention and deletion terms before accepting customer files.
 
-1. **Isolate the analysis step.** `androguard` parses untrusted, potentially
-   malicious input — run it in a locked-down container/subprocess with
-   CPU/memory/time limits, not directly in your web server process.
-2. **Add file-size caps and real upload validation** (magic-byte checks, not
-   just the `.apk` extension) — already stubbed in `app.py` via
-   `MAX_UPLOAD_MB`, but tighten it for prod.
-3. **Rate-limit and auth-gate** uploads — public malware-scanning endpoints
-   are an abuse magnet.
-4. **Clean up temp files** aggressively (already done per-scan, but audit
-   under concurrent load).
-5. Consider adding a **VirusTotal hash lookup** as a second opinion — cheap
-   to add, meaningfully improves signal for known-malware families.
+Complete these requirements before launch:
 
-Happy to help with any of these when you're ready to move past local testing.
+1. **Isolate APK analysis.** Run Androguard in a disposable worker/container with no
+   network access, a non-root user, read-only filesystem where possible, and strict CPU,
+   memory, process-count, and wall-clock limits. Keep parsing away from the web process.
+2. **Use a durable job queue.** Return a scan ID, track queued/running/complete/failed
+   states, support cancellation and retries, and prevent concurrent jobs from exhausting
+   a web worker.
+3. **Harden uploads.** Enforce limits at the proxy and application; validate APK/ZIP
+   content rather than relying on file extensions; cap archive entries and expanded size;
+   reject path traversal and malformed archives; and clean up every temporary file.
+4. **Enforce tenant isolation.** Verify authorization and database row-level security for
+   users, scan history, PDFs, and any object storage. A user must never read another
+   tenant's scan or report by changing an identifier or URL.
+5. **Protect uploaded data and detected secrets.** Reports can contain unmasked credential
+   values. Encrypt stored files and report data, keep them out of logs, restrict staff
+   access, define short retention periods, and provide deletion. Limit full-value secret
+   access to users authorized for that APK.
+6. **Harden accounts and abuse controls.** Require verified accounts, apply login and
+   upload rate limits, protect password reset and payment flows, set secure session
+   handling, and add signup abuse controls.
+7. **Operate it safely.** Use HTTPS, managed secrets, dependency and image scanning,
+   backups with restore drills, monitoring, audit events, and an incident-response plan.
+8. **Validate scanner claims.** Measure false positives and missed findings on a labeled
+   corpus of clean and vulnerable APKs. Include APKM/APKS/XAPK bundles, multidex,
+   obfuscated code, and native libraries. Clearly disclose that this is static analysis;
+   runtime behavior, native code, and encrypted or downloaded code may need separate
+   review.
+
+
 
 ## Self-signed CA in WebView — finally validated (third real vulnerable app)
 
